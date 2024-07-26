@@ -423,6 +423,7 @@ func runLoadTest(ctx context.Context) error {
 		log.Info().Msg("Time's up")
 	case <-sigCh:
 		log.Info().Msg("Interrupted.. Stopping load test")
+		lightSummary(loadTestResults, loadTestResults[0].RequestTime, time.Now(), rl)
 	case err = <-errCh:
 		if err != nil {
 			log.Fatal().Err(err).Msg("Received critical error while running load test")
