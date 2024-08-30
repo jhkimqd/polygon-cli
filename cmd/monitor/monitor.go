@@ -416,7 +416,11 @@ func renderMonitorUI(ctx context.Context, ec *ethclient.Client, ms *monitorStatu
 
 			// in monitorSelectModeTransaction, blocks will always be selected
 			transactionColumnRatio := []int{30, 5, 20, 20, 5, 10}
-			ms.SelectedBlock = renderedBlocks[len(renderedBlocks)-blockTable.SelectedRow]
+			if len(renderedBlocks)-blockTable.SelectedRow < 0 {
+				ms.SelectedBlock = renderedBlocksTemp[len(renderedBlocks)-1]
+			} else {
+				ms.SelectedBlock = renderedBlocks[len(renderedBlocks)-blockTable.SelectedRow]
+			}
 			blockInfo.Rows = ui.GetSimpleBlockFields(ms.SelectedBlock)
 			transactionInfo.ColumnWidths = getColumnWidths(transactionColumnRatio, transactionInfo.Dx())
 			transactionInfo.Rows = ui.GetBlockTxTable(ms.SelectedBlock, ms.ChainID)
@@ -712,13 +716,20 @@ func renderMonitorUI(ctx context.Context, ec *ethclient.Client, ms *monitorStatu
 				setBlock = true
 			case "G", "<End>":
 				if len(renderedBlocks) < windowSize {
-					ms.TopDisplayedBlock = ms.HeadBlock
+					// ms.TopDisplayedBlock = ms.HeadBlock
 					blockTable.SelectedRow = len(renderedBlocks)
 				} else {
 					blockTable.SelectedRow = max(windowSize, len(renderedBlocks))
 				}
 				setBlock = true
 			case "<C-f>", "<PageDown>":
+				if blockTable.SelectedRow == 0 {
+					blockTable.SelectedRow = 1
+					setBlock = true
+					currentMode = monitorModeSelectBlock
+					break
+				}
+
 				nextTopBlockNumber := new(big.Int).Sub(ms.TopDisplayedBlock, big.NewInt(int64(windowSize)))
 				if nextTopBlockNumber.Cmp(zero) < 0 {
 					nextTopBlockNumber.SetInt64(0)
@@ -751,6 +762,13 @@ func renderMonitorUI(ctx context.Context, ec *ethclient.Client, ms *monitorStatu
 				forceRedraw = true
 				redraw(ms, true)
 			case "<C-b>", "<PageUp>":
+				if blockTable.SelectedRow == 0 {
+					blockTable.SelectedRow = 1
+					setBlock = true
+					currentMode = monitorModeSelectBlock
+					break
+				}
+
 				nextTopBlockNumber := new(big.Int).Add(ms.TopDisplayedBlock, big.NewInt(int64(windowSize)))
 				if nextTopBlockNumber.Cmp(ms.HeadBlock) > 0 {
 					nextTopBlockNumber.SetInt64(ms.HeadBlock.Int64())
