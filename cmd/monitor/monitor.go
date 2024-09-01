@@ -417,7 +417,10 @@ func renderMonitorUI(ctx context.Context, ec *ethclient.Client, ms *monitorStatu
 			// in monitorSelectModeTransaction, blocks will always be selected
 			transactionColumnRatio := []int{30, 5, 20, 20, 5, 10}
 			if len(renderedBlocks)-blockTable.SelectedRow < 0 {
-				ms.SelectedBlock = renderedBlocksTemp[len(renderedBlocks)-1]
+				// ms.SelectedBlock = renderedBlocksTemp[len(renderedBlocks)]
+				return
+			} else if len(renderedBlocks) == 0 {
+				return
 			} else {
 				ms.SelectedBlock = renderedBlocks[len(renderedBlocks)-blockTable.SelectedRow]
 			}
@@ -532,19 +535,25 @@ func renderMonitorUI(ctx context.Context, ec *ethclient.Client, ms *monitorStatu
 					Int("renderedBlocks", len(renderedBlocks)).
 					Msg("setBlock")
 
-				ms.SelectedBlock = renderedBlocks[len(renderedBlocks)-blockTable.SelectedRow]
+				if len(renderedBlocks)-blockTable.SelectedRow < 0 {
+					// ms.SelectedBlock = renderedBlocksTemp[len(renderedBlocks)]
+					return
+				} else if len(renderedBlocks) == 0 {
+					return
+				} else {
+					ms.SelectedBlock = renderedBlocks[len(renderedBlocks)-blockTable.SelectedRow]
+				}
+				// ms.SelectedBlock = renderedBlocks[len(renderedBlocks)-blockTable.SelectedRow]
 				blockInfo.Rows = ui.GetSimpleBlockFields(ms.SelectedBlock)
 				transactionInfo.ColumnWidths = getColumnWidths(transactionColumnRatio, transactionInfo.Dx())
 				transactionInfo.Rows = ui.GetBlockTxTable(ms.SelectedBlock, ms.ChainID)
 				transactionInfo.Title = fmt.Sprintf("Latest Transactions for Block #%s", ms.SelectedBlock.Number().String())
-
 				setBlock = false
 				log.Debug().Uint64("blockNumber", ms.SelectedBlock.Number().Uint64()).Msg("Selected block changed")
 			}
 		} else {
 			ms.SelectedBlock = nil
 			blockInfo.Rows = []string{}
-
 			transactionInfo.ColumnWidths = getColumnWidths(transactionColumnRatio, transactionInfo.Dx())
 			if len(renderedBlocks) > 0 {
 				i := len(renderedBlocks) - 1
