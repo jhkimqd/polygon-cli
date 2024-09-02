@@ -725,13 +725,24 @@ func renderMonitorUI(ctx context.Context, ec *ethclient.Client, ms *monitorStatu
 				setBlock = true
 			case "G", "<End>":
 				if len(renderedBlocks) < windowSize {
-					// ms.TopDisplayedBlock = ms.HeadBlock
 					blockTable.SelectedRow = len(renderedBlocks)
 				} else {
 					blockTable.SelectedRow = max(windowSize, len(renderedBlocks))
 				}
 				setBlock = true
 			case "<C-f>", "<PageDown>":
+				// When pressing PageDown beyond the genesis block, redraw the monitor screen to avoid freezing at the previous rendered blocks.
+				if renderedBlocks[0].Number().String() == "0" || renderedBlocks[0].Number().String() == "1" {
+					blockTable.SelectedRow = len(renderedBlocks)
+					forceRedraw = true
+					redraw(ms, true)
+					break
+				}
+
+				if len(renderedBlocks) < windowSize {
+					blockTable.SelectedRow = len(renderedBlocks)
+				}
+
 				if blockTable.SelectedRow == 0 {
 					blockTable.SelectedRow = 1
 					setBlock = true
