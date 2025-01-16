@@ -6,16 +6,18 @@ import (
 
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/p2p/discover"
+	"github.com/ethereum/go-ethereum/p2p/dnsdisc"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/rs/zerolog/log"
 	"github.com/spf13/cobra"
 
-	"github.com/maticnetwork/polygon-cli/p2p"
+	"github.com/0xPolygon/polygon-cli/p2p"
 )
 
 type (
 	crawlParams struct {
 		Bootnodes            string
+		DiscoveryDNS         string
 		Timeout              string
 		timeout              time.Duration
 		Threads              int
@@ -23,6 +25,7 @@ type (
 		NodesFile            string
 		Database             string
 		RevalidationInterval string
+		OnlyURLs             bool
 
 		revalidationInterval time.Duration
 	}
@@ -55,6 +58,16 @@ var CrawlCmd = &cobra.Command{
 		return nil
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
+		// Discovery DNS mode
+		if inputCrawlParams.DiscoveryDNS != "" {
+			dnsclient := dnsdisc.NewClient(dnsdisc.Config{})
+			tree, err := dnsclient.SyncTree(inputCrawlParams.DiscoveryDNS)
+			if err != nil {
+				return err
+			}
+			return p2p.WriteDNSTreeNodes(inputCrawlParams.NodesFile, tree)
+		}
+		// Discover V4/V5 mode
 		nodes, err := p2p.ReadNodeSet(inputCrawlParams.NodesFile)
 		if err != nil {
 			log.Warn().Err(err).Msgf("Creating nodes file %v because it does not exist", inputCrawlParams.NodesFile)
@@ -90,7 +103,13 @@ var CrawlCmd = &cobra.Command{
 		log.Info().Msg("Starting crawl")
 
 		output := c.run(inputCrawlParams.timeout, inputCrawlParams.Threads)
-		return p2p.WriteNodeSet(inputCrawlParams.NodesFile, output)
+
+		if inputCrawlParams.OnlyURLs {
+			return p2p.WriteURLs(inputCrawlParams.NodesFile, output)
+		}
+
+		return p2p.WriteNodeSet(inputCrawlParams.NodesFile, output, false)
+
 	},
 }
 
@@ -98,12 +117,12 @@ func init() {
 	CrawlCmd.PersistentFlags().StringVarP(&inputCrawlParams.Bootnodes, "bootnodes", "b", "",
 		`Comma separated nodes used for bootstrapping. At least one bootnode is
 required, so other nodes in the network can discover each other.`)
-	if err := CrawlCmd.MarkPersistentFlagRequired("bootnodes"); err != nil {
-		log.Error().Err(err).Msg("Failed to mark bootnodes as required persistent flag")
-	}
+	CrawlCmd.PersistentFlags().StringVarP(&inputCrawlParams.DiscoveryDNS, "discovery-dns", "", "", `Enable EIP-1459, DNS Discovery to recover node list from given ENRTree`)
+	CrawlCmd.MarkFlagsMutuallyExclusive("bootnodes", "discovery-dns")
 	CrawlCmd.PersistentFlags().StringVarP(&inputCrawlParams.Timeout, "timeout", "t", "30m0s", "Time limit for the crawl")
 	CrawlCmd.PersistentFlags().IntVarP(&inputCrawlParams.Threads, "parallel", "p", 16, "How many parallel discoveries to attempt")
 	CrawlCmd.PersistentFlags().Uint64VarP(&inputCrawlParams.NetworkID, "network-id", "n", 0, "Filter discovered nodes by this network id")
 	CrawlCmd.PersistentFlags().StringVarP(&inputCrawlParams.Database, "database", "d", "", "Node database for updating and storing client information")
 	CrawlCmd.PersistentFlags().StringVarP(&inputCrawlParams.RevalidationInterval, "revalidation-interval", "r", "10m", "Time before retrying to connect to a failed peer")
+	CrawlCmd.PersistentFlags().BoolVarP(&inputCrawlParams.OnlyURLs, "only-urls", "u", true, "Only writes the enode URLs to the output")
 }

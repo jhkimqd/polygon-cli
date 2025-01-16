@@ -7,8 +7,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"reflect"
 
 	"github.com/cenkalti/backoff"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/consensus/clique"
 	ethcrypto "github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
@@ -134,6 +136,11 @@ func GetReceipts(ctx context.Context, rawBlocks []*json.RawMessage, c *ethrpc.Cl
 		blmsBlockMap[i] = txHashMap[tx]
 	}
 
+	if len(blms) == 0 {
+		log.Debug().Int("Length of BatchElem", len(blms)).Msg("BatchElem is empty")
+		return nil, nil
+	}
+
 	var start uint64 = 0
 	for {
 		last := false
@@ -163,8 +170,8 @@ func GetReceipts(ctx context.Context, rawBlocks []*json.RawMessage, c *ethrpc.Cl
 
 		err := c.BatchCallContext(ctx, blms[start:end])
 		if err != nil {
-			log.Error().Err(err).Str("randtx", txHashes[0]).Uint64("start", start).Uint64("end", end).Msg("RPC issue fetching receipts")
-			return nil, err
+			log.Error().Err(err).Str("randtx", txHashes[0]).Uint64("start", start).Uint64("end", end).Msg("RPC issue fetching receipts, have you checked the batch size limit of the RPC endpoint and adjusted the --batch-size flag?")
+			break
 		}
 		start = end
 		if last {
@@ -180,6 +187,10 @@ func GetReceipts(ctx context.Context, rawBlocks []*json.RawMessage, c *ethrpc.Cl
 			return nil, b.Error
 		}
 		receipts = append(receipts, b.Result.(*json.RawMessage))
+	}
+	if len(receipts) == 0 {
+		log.Error().Msg("No receipts have been fetched")
+		return nil, nil
 	}
 	log.Info().Int("hashes", len(txHashes)).Int("receipts", len(receipts)).Msg("Fetched tx receipts")
 	return receipts, nil
@@ -201,6 +212,77 @@ func GetTxPoolStatus(rpc *ethrpc.Client) (uint64, uint64, error) {
 	}
 
 	return pendingCount, queuedCount, nil
+}
+
+func GetZkEVMBatches(rpc *ethrpc.Client) (uint64, uint64, uint64, error) {
+	trustedBatches, err := getZkEVMBatch(rpc, trusted)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+
+	virtualBatches, err := getZkEVMBatch(rpc, virtual)
+	if err != nil {
+		return trustedBatches, 0, 0, err
+	}
+
+	verifiedBatches, err := getZkEVMBatch(rpc, verified)
+	if err != nil {
+		return trustedBatches, virtualBatches, 0, err
+	}
+
+	return trustedBatches, virtualBatches, verifiedBatches, nil
+}
+
+func GetForkID(rpc *ethrpc.Client) (uint64, error) {
+	var raw interface{}
+	if err := rpc.Call(&raw, "zkevm_getForkId"); err != nil {
+		return 0, err
+	}
+	forkID, err := hexutil.DecodeUint64(fmt.Sprintf("%v", raw))
+	if err != nil {
+		return 0, err
+	}
+	return forkID, nil
+}
+
+func GetRollupAddress(rpc *ethrpc.Client) (string, error) {
+	var raw interface{}
+	if err := rpc.Call(&raw, "zkevm_getRollupAddress"); err != nil {
+		return "", err
+	}
+	rollupAddress := fmt.Sprintf("%v", raw)
+
+	return rollupAddress, nil
+}
+
+func GetRollupManagerAddress(rpc *ethrpc.Client) (string, error) {
+	var raw interface{}
+	if err := rpc.Call(&raw, "zkevm_getRollupManagerAddress"); err != nil {
+		return "", err
+	}
+	rollupManagerAddress := fmt.Sprintf("%v", raw)
+
+	return rollupManagerAddress, nil
+}
+
+type batch string
+
+const (
+	trusted  batch = "zkevm_batchNumber"
+	virtual  batch = "zkevm_virtualBatchNumber"
+	verified batch = "zkevm_verifiedBatchNumber"
+)
+
+func getZkEVMBatch(rpc *ethrpc.Client, batchType batch) (uint64, error) {
+	var raw interface{}
+	if err := rpc.Call(&raw, string(batchType)); err != nil {
+		return 0, err
+	}
+	batch, err := hexutil.DecodeUint64(fmt.Sprintf("%v", raw))
+	if err != nil {
+		return 0, err
+	}
+	return batch, nil
 }
 
 func tryCastToUint64(val any) (uint64, error) {
@@ -235,4 +317,43 @@ func BlockUntilSuccessful(ctx context.Context, c *ethclient.Client, retryable fu
 	// this function use to be very complicated (and not work). I'm dumbing this down to a basic time based retryable which should work 99% of the time
 	b := backoff.WithContext(backoff.WithMaxRetries(backoff.NewConstantBackOff(5*time.Second), 24), ctx)
 	return backoff.Retry(retryable, b)
+}
+
+func WrapDeployedCode(deployedBytecode string, storageBytecode string) string {
+	deployedBytecode = strings.ToLower(strings.TrimPrefix(deployedBytecode, "0x"))
+	storageBytecode = strings.ToLower(strings.TrimPrefix(storageBytecode, "0x"))
+
+	codeCopySize := len(deployedBytecode) / 2
+	codeCopyOffset := (len(storageBytecode)/2) + 13 + 8  // 13 for CODECOPY + 8 for RETURN
+
+	return fmt.Sprintf(
+		"0x%s"+			// storage initialization code
+		"63%08x"+		// PUSH4 to indicate the size of the data that should be copied into memory
+		"63%08x"+		// PUSH4 to indicate the offset in the call data to start the copy
+		"6000"+			// PUSH1 00 to indicate the destination offset in memory
+		"39"+			// CODECOPY
+		"63%08x"+		// PUSH4 to indicate the size of the data to be returned from memory
+		"6000"+			// PUSH1 00 to indicate that it starts from offset 0
+		"f3"+			// RETURN
+		"%s",			// CODE starts here.
+		storageBytecode, codeCopySize, codeCopyOffset, codeCopySize, deployedBytecode)
+}
+
+func GetHexString(data any) string {
+	var result string
+	if reflect.TypeOf(data).Kind() == reflect.Float64 {
+		result = fmt.Sprintf("%x", int64(data.(float64)))
+	} else if reflect.TypeOf(data).Kind() == reflect.String {
+		if strings.HasPrefix(data.(string), "0x") {
+			result = strings.TrimPrefix(data.(string), "0x")
+		} else {
+			result = data.(string)
+		}
+	} else {
+		log.Fatal().Any("data", data).Msg("unknown storage data type")
+	}
+	if len(result) % 2 != 0 {
+		result = "0" + result
+	}
+	return strings.ToLower(result)
 }

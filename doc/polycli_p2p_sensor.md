@@ -23,19 +23,22 @@ If no nodes.json file exists, it will be created.
 ## Flags
 
 ```bash
+      --api-port uint            Port the API server will listen on (default 8080)
   -b, --bootnodes string         Comma separated nodes used for bootstrapping
   -d, --database-id string       Datastore database ID
       --dial-ratio int           Ratio of inbound to dialed connections. A dial ratio of 2 allows 1/2 of
                                  connections to be dialed. Setting this to 0 defaults it to 3.
+      --discovery-dns string     DNS discovery ENR tree url
       --discovery-port int       UDP P2P discovery port (default 30303)
       --fork-id bytesHex         The hex encoded fork id (omit the 0x) (default F097BC13)
       --genesis-hash string      The genesis block hash (default "0xa9c28ce2141b56c474f1dc504bee9b01eb1bd7d1a507580d5519d4437a97de1b")
   -h, --help                     help for sensor
-  -k, --key-file string          Private key file
+      --key string               Hex-encoded private key (cannot be set with --key-file)
+  -k, --key-file string          Private key file (cannot be set with --key)
   -D, --max-db-concurrency int   Maximum number of concurrent database operations to perform. Increasing this
                                  will result in less chance of missing data (i.e. broken pipes) but can
                                  significantly increase memory usage. (default 10000)
-  -m, --max-peers int            Maximum number of peers to connect to (default 200)
+  -m, --max-peers int            Maximum number of peers to connect to (default 2000)
       --nat string               NAT port mapping mechanism (any|none|upnp|pmp|pmp:<IP>|extip:<IP>) (default "any")
   -n, --network-id uint          Filter discovered nodes by this network ID
       --port int                 TCP network listening port (default 30303)
@@ -53,6 +56,7 @@ If no nodes.json file exists, it will be created.
       --ttl duration             Time to live (default 336h0m0s)
       --write-block-events       Whether to write block events to the database (default true)
   -B, --write-blocks             Whether to write blocks to the database (default true)
+      --write-peers              Whether to write peers to the database (default true)
       --write-tx-events          Whether to write transaction events to the database. This option could
                                  significantly increase CPU and memory usage. (default true)
   -t, --write-txs                Whether to write transactions to the database. This option could significantly

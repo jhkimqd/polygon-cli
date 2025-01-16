@@ -20,7 +20,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
-	"github.com/maticnetwork/polygon-cli/p2p/database"
+	"github.com/0xPolygon/polygon-cli/p2p/database"
 )
 
 // conn represents an individual connection with a peer.
@@ -33,12 +33,16 @@ type conn struct {
 	head      *HeadBlock
 	headMutex *sync.RWMutex
 	counter   *prometheus.CounterVec
+	name      string
 
 	// requests is used to store the request ID and the block hash. This is used
 	// when fetching block bodies because the eth protocol block bodies do not
 	// contain information about the block hash.
 	requests   *list.List
 	requestNum uint64
+
+	// Linked list of seen block hashes with timestamps.
+	blockHashes *list.List
 
 	// oldestBlock stores the first block the sensor has seen so when fetching
 	// parent blocks, it does not request blocks older than this.
@@ -71,6 +75,14 @@ type HeadBlock struct {
 	Time            uint64
 }
 
+type BlockHashEntry struct {
+	hash common.Hash
+	time time.Time
+}
+
+// blockHashTTL defines the time-to-live for block hash entries in blockHashes list.
+var blockHashTTL = 10 * time.Minute
+
 // NewEthProctocol creates the new eth protocol. This will handle writing the
 // status exchange, message handling, and writing blocks/txs to the database.
 func NewEthProtocol(version uint, opts EthProtocolOptions) ethp2p.Protocol {
@@ -80,16 +92,18 @@ func NewEthProtocol(version uint, opts EthProtocolOptions) ethp2p.Protocol {
 		Length:  17,
 		Run: func(p *ethp2p.Peer, rw ethp2p.MsgReadWriter) error {
 			c := conn{
-				sensorID:   opts.SensorID,
-				node:       p.Node(),
-				logger:     log.With().Str("peer", p.Node().URLv4()).Logger(),
-				rw:         rw,
-				db:         opts.Database,
-				requests:   list.New(),
-				requestNum: 0,
-				head:       opts.Head,
-				headMutex:  opts.HeadMutex,
-				counter:    opts.MsgCounter,
+				sensorID:    opts.SensorID,
+				node:        p.Node(),
+				logger:      log.With().Str("peer", p.Node().URLv4()).Logger(),
+				rw:          rw,
+				db:          opts.Database,
+				requests:    list.New(),
+				requestNum:  0,
+				head:        opts.Head,
+				headMutex:   opts.HeadMutex,
+				counter:     opts.MsgCounter,
+				name:        p.Fullname(),
+				blockHashes: list.New(),
 			}
 
 			c.headMutex.RLock()
@@ -213,7 +227,11 @@ func (c *conn) readStatus(packet *eth.StatusPacket) error {
 	}
 
 	if status.Genesis != packet.Genesis {
-		return fmt.Errorf("genesis mismatch: %d (!= %d)", status.Genesis, packet.Genesis)
+		return fmt.Errorf("genesis mismatch: %v (!= %v)", status.Genesis, packet.Genesis)
+	}
+
+	if status.ForkID.Hash != packet.ForkID.Hash {
+		return fmt.Errorf("fork ID mismatch: %v (!= %v)", status.ForkID, packet.ForkID)
 	}
 
 	c.logger.Info().
@@ -294,19 +312,67 @@ func (c *conn) handleNewBlockHashes(ctx context.Context, msg ethp2p.Msg) error {
 		return err
 	}
 
-	c.counter.WithLabelValues(fmt.Sprint(msg.Code), packet.Name()).Add(float64(len(packet)))
+	tfs := time.Now()
 
-	hashes := make([]common.Hash, 0, len(packet))
-	for _, hash := range packet {
-		hashes = append(hashes, hash.Hash)
-		if err := c.getBlockData(hash.Hash); err != nil {
+	c.counter.WithLabelValues(packet.Name(), c.node.URLv4(), c.name).Add(float64(len(packet)))
+
+	// Collect unique hashes for database write.
+	uniqueHashes := make([]common.Hash, 0, len(packet))
+
+	for _, entry := range packet {
+		hash := entry.Hash
+
+		// Check if we've seen the hash and remove old entries
+		if c.hasSeenBlockHash(hash) {
+			continue
+		}
+
+		// Attempt to fetch block data first
+		if err := c.getBlockData(hash); err != nil {
 			return err
 		}
+
+		// Now that we've successfully fetched, record the new block hash
+		c.addBlockHash(hash)
+		uniqueHashes = append(uniqueHashes, hash)
 	}
 
-	c.db.WriteBlockHashes(ctx, c.node, hashes)
+	// Write only unique hashes to the database.
+	if len(uniqueHashes) > 0 {
+		c.db.WriteBlockHashes(ctx, c.node, uniqueHashes, tfs)
+	}
 
 	return nil
+}
+
+// addBlockHash adds a new block hash with a timestamp to the blockHashes list.
+func (c *conn) addBlockHash(hash common.Hash) {
+	now := time.Now()
+
+	// Add the new block hash entry to the list.
+	c.blockHashes.PushBack(BlockHashEntry{
+		hash: hash,
+		time: now,
+	})
+}
+
+// Helper method to check if a block hash is already in blockHashes.
+func (c *conn) hasSeenBlockHash(hash common.Hash) bool {
+	now := time.Now()
+	for e := c.blockHashes.Front(); e != nil; e = e.Next() {
+		entry := e.Value.(BlockHashEntry)
+		// Check if the hash matches. We can short circuit here because there will
+		// be block hashes that we haven't seen before, which will make a full
+		// iteration of the blockHashes linked list.
+		if entry.hash.Cmp(hash) == 0 {
+			return true
+		}
+		// Remove entries older than blockHashTTL.
+		if now.Sub(entry.time) > blockHashTTL {
+			c.blockHashes.Remove(e)
+		}
+	}
+	return false
 }
 
 func (c *conn) handleTransactions(ctx context.Context, msg ethp2p.Msg) error {
@@ -315,9 +381,11 @@ func (c *conn) handleTransactions(ctx context.Context, msg ethp2p.Msg) error {
 		return err
 	}
 
-	c.counter.WithLabelValues(fmt.Sprint(msg.Code), txs.Name()).Add(float64(len(txs)))
+	tfs := time.Now()
 
-	c.db.WriteTransactions(ctx, c.node, txs)
+	c.counter.WithLabelValues(txs.Name(), c.node.URLv4(), c.name).Add(float64(len(txs)))
+
+	c.db.WriteTransactions(ctx, c.node, txs, tfs)
 
 	return nil
 }
@@ -328,7 +396,7 @@ func (c *conn) handleGetBlockHeaders(msg ethp2p.Msg) error {
 		return err
 	}
 
-	c.counter.WithLabelValues(fmt.Sprint(msg.Code), request.Name()).Inc()
+	c.counter.WithLabelValues(request.Name(), c.node.URLv4(), c.name).Inc()
 
 	return ethp2p.Send(
 		c.rw,
@@ -343,8 +411,10 @@ func (c *conn) handleBlockHeaders(ctx context.Context, msg ethp2p.Msg) error {
 		return err
 	}
 
+	tfs := time.Now()
+
 	headers := packet.BlockHeadersRequest
-	c.counter.WithLabelValues(fmt.Sprint(msg.Code), packet.Name()).Add(float64(len(headers)))
+	c.counter.WithLabelValues(packet.Name(), c.node.URLv4(), c.name).Add(float64(len(headers)))
 
 	for _, header := range headers {
 		if err := c.getParentBlock(ctx, header); err != nil {
@@ -352,8 +422,7 @@ func (c *conn) handleBlockHeaders(ctx context.Context, msg ethp2p.Msg) error {
 		}
 	}
 
-	c.db.WriteBlockHeaders(ctx, headers)
-
+	c.db.WriteBlockHeaders(ctx, headers, tfs)
 	return nil
 }
 
@@ -363,7 +432,7 @@ func (c *conn) handleGetBlockBodies(msg ethp2p.Msg) error {
 		return err
 	}
 
-	c.counter.WithLabelValues(fmt.Sprint(msg.Code), request.Name()).Add(float64(len(request.GetBlockBodiesRequest)))
+	c.counter.WithLabelValues(request.Name(), c.node.URLv4(), c.name).Add(float64(len(request.GetBlockBodiesRequest)))
 
 	return ethp2p.Send(
 		c.rw,
@@ -378,11 +447,13 @@ func (c *conn) handleBlockBodies(ctx context.Context, msg ethp2p.Msg) error {
 		return err
 	}
 
+	tfs := time.Now()
+
 	if len(packet.BlockBodiesResponse) == 0 {
 		return nil
 	}
 
-	c.counter.WithLabelValues(fmt.Sprint(msg.Code), packet.Name()).Add(float64(len(packet.BlockBodiesResponse)))
+	c.counter.WithLabelValues(packet.Name(), c.node.URLv4(), c.name).Add(float64(len(packet.BlockBodiesResponse)))
 
 	var hash *common.Hash
 	for e := c.requests.Front(); e != nil; e = e.Next() {
@@ -400,7 +471,7 @@ func (c *conn) handleBlockBodies(ctx context.Context, msg ethp2p.Msg) error {
 		return nil
 	}
 
-	c.db.WriteBlockBody(ctx, packet.BlockBodiesResponse[0], *hash)
+	c.db.WriteBlockBody(ctx, packet.BlockBodiesResponse[0], *hash, tfs)
 
 	return nil
 }
@@ -411,7 +482,9 @@ func (c *conn) handleNewBlock(ctx context.Context, msg ethp2p.Msg) error {
 		return err
 	}
 
-	c.counter.WithLabelValues(fmt.Sprint(msg.Code), block.Name()).Inc()
+	tfs := time.Now()
+
+	c.counter.WithLabelValues(block.Name(), c.node.URLv4(), c.name).Inc()
 
 	// Set the head block if newer.
 	c.headMutex.Lock()
@@ -422,7 +495,6 @@ func (c *conn) handleNewBlock(ctx context.Context, msg ethp2p.Msg) error {
 			Number:          block.Block.Number().Uint64(),
 			Time:            block.Block.Time(),
 		}
-
 		c.logger.Info().Interface("head", c.head).Msg("Setting head block")
 	}
 	c.headMutex.Unlock()
@@ -431,7 +503,7 @@ func (c *conn) handleNewBlock(ctx context.Context, msg ethp2p.Msg) error {
 		return err
 	}
 
-	c.db.WriteBlock(ctx, c.node, block.Block, block.TD)
+	c.db.WriteBlock(ctx, c.node, block.Block, block.TD, tfs)
 
 	return nil
 }
@@ -442,7 +514,7 @@ func (c *conn) handleGetPooledTransactions(msg ethp2p.Msg) error {
 		return err
 	}
 
-	c.counter.WithLabelValues(fmt.Sprint(msg.Code), request.Name()).Add(float64(len(request.GetPooledTransactionsRequest)))
+	c.counter.WithLabelValues(request.Name(), c.node.URLv4(), c.name).Add(float64(len(request.GetPooledTransactionsRequest)))
 
 	return ethp2p.Send(
 		c.rw,
@@ -455,15 +527,8 @@ func (c *conn) handleNewPooledTransactionHashes(version uint, msg ethp2p.Msg) er
 	var name string
 
 	switch version {
-	case 66, 67:
-		var txs eth.NewPooledTransactionHashesPacket67
-		if err := msg.Decode(&txs); err != nil {
-			return err
-		}
-		hashes = txs
-		name = txs.Name()
-	case 68:
-		var txs eth.NewPooledTransactionHashesPacket68
+	case 67, 68:
+		var txs eth.NewPooledTransactionHashesPacket
 		if err := msg.Decode(&txs); err != nil {
 			return err
 		}
@@ -473,7 +538,7 @@ func (c *conn) handleNewPooledTransactionHashes(version uint, msg ethp2p.Msg) er
 		return errors.New("protocol version not found")
 	}
 
-	c.counter.WithLabelValues(fmt.Sprint(msg.Code), name).Add(float64(len(hashes)))
+	c.counter.WithLabelValues(name, c.node.URLv4(), c.name).Add(float64(len(hashes)))
 
 	if !c.db.ShouldWriteTransactions() || !c.db.ShouldWriteTransactionEvents() {
 		return nil
@@ -492,9 +557,11 @@ func (c *conn) handlePooledTransactions(ctx context.Context, msg ethp2p.Msg) err
 		return err
 	}
 
-	c.counter.WithLabelValues(fmt.Sprint(msg.Code), packet.Name()).Add(float64(len(packet.PooledTransactionsResponse)))
+	tfs := time.Now()
 
-	c.db.WriteTransactions(ctx, c.node, packet.PooledTransactionsResponse)
+	c.counter.WithLabelValues(packet.Name(), c.node.URLv4(), c.name).Add(float64(len(packet.PooledTransactionsResponse)))
+
+	c.db.WriteTransactions(ctx, c.node, packet.PooledTransactionsResponse, tfs)
 
 	return nil
 }

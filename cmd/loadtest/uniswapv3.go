@@ -13,15 +13,15 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
-	"github.com/maticnetwork/polygon-cli/bindings/uniswapv3"
-	uniswapv3loadtest "github.com/maticnetwork/polygon-cli/cmd/loadtest/uniswapv3"
+	"github.com/0xPolygon/polygon-cli/bindings/uniswapv3"
+	uniswapv3loadtest "github.com/0xPolygon/polygon-cli/cmd/loadtest/uniswapv3"
 	"github.com/rs/zerolog/log"
 )
 
 var (
 	//go:embed uniswapv3Usage.md
 	uniswapv3Usage          string
-	uniswapv3LoadTestParams params
+	uniswapv3LoadTestParams uniswap3params
 )
 
 var uniswapV3LoadTestCmd = &cobra.Command{
@@ -62,7 +62,7 @@ func checkUniswapV3LoadtestFlags() error {
 	return nil
 }
 
-type params struct {
+type uniswap3params struct {
 	UniswapFactoryV3, UniswapMulticall, UniswapProxyAdmin, UniswapTickLens, UniswapNFTLibDescriptor, UniswapNonfungibleTokenPositionDescriptor, UniswapUpgradeableProxy, UniswapNonfungiblePositionManager, UniswapMigrator, UniswapStaker, UniswapQuoterV2, UniswapSwapRouter, WETH9, UniswapPoolToken0, UniswapPoolToken1 *string
 	PoolFees                                                                                                                                                                                                                                                                                                                *float64
 	SwapAmountInput                                                                                                                                                                                                                                                                                                         *uint64
@@ -70,7 +70,7 @@ type params struct {
 
 func init() {
 	// Specify subcommand flags.
-	params := new(params)
+	params := new(uniswap3params)
 
 	// Pre-deployed addresses.
 	params.UniswapFactoryV3 = uniswapV3LoadTestCmd.Flags().String("uniswap-factory-v3-address", "", "The address of a pre-deployed UniswapFactoryV3 contract")

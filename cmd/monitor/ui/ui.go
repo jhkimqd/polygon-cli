@@ -10,44 +10,81 @@ import (
 	"strings"
 	"time"
 
+	"github.com/0xPolygon/polygon-cli/metrics"
+	"github.com/0xPolygon/polygon-cli/rpctypes"
 	ethcommon "github.com/ethereum/go-ethereum/common"
 	ethrpc "github.com/ethereum/go-ethereum/rpc"
 	ui "github.com/gizak/termui/v3"
 	"github.com/gizak/termui/v3/widgets"
-	"github.com/maticnetwork/polygon-cli/metrics"
-	"github.com/maticnetwork/polygon-cli/rpctypes"
 	"github.com/rs/zerolog/log"
 )
 
+var (
+	// zero is big.Int representations of 0, used for convenience in calculations.
+	zero = big.NewInt(0)
+)
+
 type UiSkeleton struct {
-	Current         *widgets.Paragraph
-	TxPerBlockChart *widgets.Sparkline
-	GasPriceChart   *widgets.Sparkline
-	BlockSizeChart  *widgets.Sparkline
-	PendingTxChart  *widgets.Sparkline
-	GasChart        *widgets.Sparkline
-	BlockInfo       *widgets.List
-	TxInfo          *widgets.List
-	Receipts        *widgets.List
+	Current, TxPool, ZkEVM, Rollup *widgets.Paragraph
+	TxPerBlockChart                *widgets.Sparkline
+	GasPriceChart                  *widgets.Sparkline
+	BlockSizeChart                 *widgets.Sparkline
+	PendingTxChart                 *widgets.Sparkline
+	GasChart                       *widgets.Sparkline
+	BlockInfo                      *widgets.List
+	TxInfo                         *widgets.List
+	Receipts                       *widgets.List
 }
 
-func GetCurrentBlockInfo(headBlock *big.Int, gasPrice *big.Int, peerCount uint64, pendingCount uint64, queuedCount uint64, chainID *big.Int, blocks []rpctypes.PolyBlock, dx int, dy int) string {
+func GetCurrentText(widget *widgets.Paragraph, headBlock *big.Int, gasPrice string, peerCount uint64, chainID *big.Int, rpcURL string) string {
+	// First column
+	height := fmt.Sprintf("Height: %s", headBlock.String())
+	timeInfo := fmt.Sprintf("Time: %s", time.Now().Format("02 Jan 06 15:04:05 MST"))
+	gasPriceString := fmt.Sprintf("Gas Price: %s gwei", gasPrice)
+	peers := fmt.Sprintf("Peers: %d", peerCount)
+
+	// Second column
+	rpcURLString := fmt.Sprintf("RPC URL: %s", rpcURL)
+	chainIdString := fmt.Sprintf("Chain ID: %s", chainID.String())
+
+	return formatParagraph(widget, []string{height, timeInfo, gasPriceString, peers, chainIdString, rpcURLString})
+}
+
+func GetTxPoolText(widget *widgets.Paragraph, pendingTxCount, queuedTxCount uint64) string {
+	pendingTx := fmt.Sprintf("Pending Tx: %d", pendingTxCount)
+	queuedTx := fmt.Sprintf("Queued Tx: %d", queuedTxCount)
+	return formatParagraph(widget, []string{pendingTx, queuedTx})
+}
+
+func GetZkEVMText(widget *widgets.Paragraph, trustedBatchesCount, virtualBatchesCount, verifiedBatchesCount uint64) string {
+	trustedBatches := fmt.Sprintf("Trusted:  %d", trustedBatchesCount)
+	trustedVirtualBatchesGap := trustedBatchesCount - virtualBatchesCount
+	virtualBatches := fmt.Sprintf("Virtual:  %d (%d)", virtualBatchesCount, trustedVirtualBatchesGap)
+
+	trustedVerifiedBatchesGap := trustedBatchesCount - verifiedBatchesCount
+	verifiedBatches := fmt.Sprintf("Verified: %d (%d)", verifiedBatchesCount, trustedVerifiedBatchesGap)
+	return formatParagraph(widget, []string{trustedBatches, virtualBatches, verifiedBatches})
+}
+
+func GetRollupText(widget *widgets.Paragraph, forkID uint64, rollupAddress string, rollupManagerAddress string) string {
+	forkIDString := fmt.Sprintf("ForkID:  %d", forkID)
+	rollupAddressString := fmt.Sprintf("RollupAddress:  %s", rollupAddress)
+	rollupManagerAddressString := fmt.Sprintf("RollupManagerAddress:  %s", rollupManagerAddress)
+
+	return formatParagraph(widget, []string{forkIDString, rollupAddressString, rollupManagerAddressString})
+}
+
+func formatParagraph(widget *widgets.Paragraph, content []string) string {
+	dx := widget.Inner.Dx()
+	dy := widget.Inner.Dy()
+
 	// Return an appropriate message if dy is 0 or less.
 	if dy <= 0 {
 		return "Invalid display configuration."
 	}
 
-	height := fmt.Sprintf("Height: %s", headBlock.String())
-	timeInfo := fmt.Sprintf("Time: %s", time.Now().Format("02 Jan 06 15:04:05 MST"))
-	gasPriceString := fmt.Sprintf("Gas Price: %s gwei", new(big.Int).Div(gasPrice, metrics.UnitShannon).String())
-	peers := fmt.Sprintf("Peers: %d", peerCount)
-	pendingTx := fmt.Sprintf("Pending Tx: %d", pendingCount)
-	queuedTx := fmt.Sprintf("Queued Tx: %d", queuedCount)
-	chainIdString := fmt.Sprintf("Chain ID: %s", chainID.String())
-
-	info := []string{height, timeInfo, gasPriceString, peers, pendingTx, queuedTx, chainIdString}
-	columns := len(info) / dy
-	if len(info)%dy != 0 {
+	columns := len(content) / dy
+	if len(content)%dy != 0 {
 		columns += 1 // Add an extra column for the remaining items
 	}
 
@@ -56,8 +93,8 @@ func GetCurrentBlockInfo(headBlock *big.Int, gasPrice *big.Int, peerCount uint64
 	for i := 0; i < columns; i++ {
 		for j := 0; j < dy; j++ {
 			index := i*dy + j
-			if index < len(info) && len(info[index]) > columnWidths[i] {
-				columnWidths[i] = len(info[index])
+			if index < len(content) && len(content[index]) > columnWidths[i] {
+				columnWidths[i] = len(content[index])
 			}
 		}
 		// Add padding and ensure it doesn't exceed 'dx'
@@ -71,25 +108,15 @@ func GetCurrentBlockInfo(headBlock *big.Int, gasPrice *big.Int, peerCount uint64
 	for i := 0; i < dy; i++ {
 		for j := 0; j < columns; j++ {
 			index := j*dy + i
-			if index < len(info) {
+			if index < len(content) {
 				formatString := fmt.Sprintf("%%-%ds", columnWidths[j])
-				formattedInfo.WriteString(fmt.Sprintf(formatString, info[index]))
+				formattedInfo.WriteString(fmt.Sprintf(formatString, content[index]))
 			}
 		}
 		formattedInfo.WriteString("\n")
 	}
 
 	return formattedInfo.String()
-}
-
-func max(nums ...int) int {
-	maxNum := nums[0]
-	for _, num := range nums[1:] {
-		if num > maxNum {
-			maxNum = num
-		}
-	}
-	return maxNum
 }
 
 func GetBlocksList(blocks []rpctypes.PolyBlock) ([]string, string) {
@@ -277,29 +304,27 @@ func GetSimpleBlockFields(block rpctypes.PolyBlock) []string {
 	parentHash := fmt.Sprintf("Parent Hash: %s", block.ParentHash())
 	uncleHash := fmt.Sprintf("Uncle Hash: %s", block.UncleHash())
 	stateRoot := fmt.Sprintf("State Root: %s", block.Root())
-	txHash := fmt.Sprintf("Tx Hash: %s", block.TxHash())
+	txRoot := fmt.Sprintf("Tx Root: %s", block.TxRoot())
 	nonce := fmt.Sprintf("Nonce: %d", block.Nonce())
 
-	maxWidthCol1 := max(len(blockHeight), len(transactions), len(difficulty), len(size), len(gasUsed), len(baseFee), len(hash), len(stateRoot))
-
-	blockHeight = fmt.Sprintf("%-*s", maxWidthCol1, blockHeight)
-	transactions = fmt.Sprintf("%-*s", maxWidthCol1, transactions)
-	difficulty = fmt.Sprintf("%-*s", maxWidthCol1, difficulty)
-	size = fmt.Sprintf("%-*s", maxWidthCol1, size)
-	gasUsed = fmt.Sprintf("%-*s", maxWidthCol1, gasUsed)
-	baseFee = fmt.Sprintf("%-*s", maxWidthCol1, baseFee)
-	hash = fmt.Sprintf("%-*s", maxWidthCol1, hash)
-	stateRoot = fmt.Sprintf("%-*s", maxWidthCol1, stateRoot)
-
 	lines := []string{
-		fmt.Sprintf("%s  %s", blockHeight, timestamp),
-		fmt.Sprintf("%s  %s", transactions, authorInfo),
-		fmt.Sprintf("%s  %s", difficulty, uncles),
-		fmt.Sprintf("%s  %s", size, gasLimit),
-		fmt.Sprintf("%s  %s", gasUsed, extraData),
-		fmt.Sprintf("%s  %s", baseFee, parentHash),
-		fmt.Sprintf("%s  %s", hash, uncleHash),
-		fmt.Sprintf("%s  %s", stateRoot, txHash),
+		blockHeight,
+		timestamp,
+		transactions,
+		authorInfo,
+		difficulty,
+		uncles,
+		size,
+		gasLimit,
+		gasUsed,
+		extraData,
+		baseFee,
+		parentHash,
+		hash,
+		uncleHash,
+		stateRoot,
+		txRoot,
+		size,
 		nonce,
 	}
 
@@ -322,6 +347,8 @@ func GetTxMethod(tx rpctypes.PolyTransaction) string {
 	if tx.To().String() == "0x0000000000000000000000000000000000000000" {
 		// Contract deployment
 		txMethod = "Contract Deployment"
+	} else if tx.Type() == 3 {
+		txMethod = "Blob"
 	} else if len(tx.Data()) > 4 {
 		// Contract call
 		txMethod = hex.EncodeToString(tx.Data()[0:4])
@@ -349,7 +376,7 @@ func GetTransactionsList(block rpctypes.PolyBlock, chainID *big.Int) ([]string, 
 	txs := block.Transactions()
 
 	headerVariables := []string{"Txn Hash", "Method", "From", "To", "Value", "Gas Price"}
-	proportion := []int{60, 5, 15, 15, 30}
+	proportion := []int{60, 5, 50, 50, 20}
 
 	header := ""
 	for i, prop := range proportion {
@@ -364,8 +391,10 @@ func GetTransactionsList(block rpctypes.PolyBlock, chainID *big.Int) ([]string, 
 		recordVariables := []string{
 			fmt.Sprintf("%s", tx.Hash()),
 			txMethod,
-			metrics.TruncateHexString(fmt.Sprintf("%s", tx.From()), 14),
-			metrics.TruncateHexString(fmt.Sprintf("%s", tx.To()), 14),
+			// metrics.TruncateHexString(fmt.Sprintf("%s", tx.From()), 14),
+			// metrics.TruncateHexString(fmt.Sprintf("%s", tx.To()), 14),
+			fmt.Sprintf("%s", tx.From()),
+			fmt.Sprintf("%s", tx.To()),
 			fmt.Sprintf("%s", tx.Value()),
 			fmt.Sprintf("%s", tx.GasPrice()),
 		}
@@ -390,14 +419,7 @@ func GetSimpleTxFields(tx rpctypes.PolyTransaction, chainID, baseFee *big.Int) [
 	fields := make([]string, 0)
 	fields = append(fields, fmt.Sprintf("Tx Hash: %s", tx.Hash()))
 
-	txMethod := "Transfer"
-	if tx.To().String() == "0x0000000000000000000000000000000000000000" {
-		// Contract deployment
-		txMethod = "Contract Deployment"
-	} else if len(tx.Data()) > 4 {
-		// Contract call
-		txMethod = hex.EncodeToString(tx.Data()[0:4])
-	}
+	txMethod := GetTxMethod(tx)
 
 	fields = append(fields, fmt.Sprintf("To: %s", tx.To()))
 	fields = append(fields, fmt.Sprintf("From: %s", tx.From()))
@@ -411,6 +433,9 @@ func GetSimpleTxFields(tx rpctypes.PolyTransaction, chainID, baseFee *big.Int) [
 	fields = append(fields, fmt.Sprintf("Type: %d", tx.Type()))
 	fields = append(fields, fmt.Sprintf("Data Len: %d", len(tx.Data())))
 	fields = append(fields, fmt.Sprintf("Data: %s", hex.EncodeToString(tx.Data())))
+	fields = append(fields, fmt.Sprintf("R: %s", tx.R()))
+	fields = append(fields, fmt.Sprintf("S: %s", tx.S()))
+	fields = append(fields, fmt.Sprintf("V: %s", tx.V()))
 
 	return fields
 }
@@ -452,13 +477,26 @@ func GetSimpleReceipt(ctx context.Context, rpc *ethrpc.Client, tx rpctypes.PolyT
 	fields = append(fields, fmt.Sprintf("CumulativeGasUsed: %d", receipt.CumulativeGasUsed().Int64()))
 	fields = append(fields, fmt.Sprintf("EffectiveGasPrice: %d", receipt.EffectiveGasPrice().Int64()))
 	fields = append(fields, fmt.Sprintf("GasUsed: %d", receipt.GasUsed().Int64()))
-	fields = append(fields, fmt.Sprintf("ContractAddress: %s", receipt.ContractAddress().String()))
-	fields = append(fields, fmt.Sprintf("Root: %s", receipt.Root().String()))
-
+	// Only output ContractAddress when the transaction involves a contract deployment.
+	if receipt.ContractAddress().String() != "0x0000000000000000000000000000000000000000" {
+		fields = append(fields, fmt.Sprintf("ContractAddress: %s", receipt.ContractAddress().String()))
+	}
+	// Only output Root when the transaction involves a pre-Byzantium block (returns non-zero Root field).
+	if receipt.Root().String() != "0x0000000000000000000000000000000000000000000000000000000000000000" {
+		fields = append(fields, fmt.Sprintf("Root: %s", receipt.Root().String()))
+	}
+	// Only output blob related field if the transaction is a blob transaction.
+	if receipt.BlobGasPrice().Cmp(zero) > 0 {
+		fields = append(fields, fmt.Sprintf("Blob Gas Price: %s", receipt.BlobGasPrice()))
+	}
+	// Only output blob related field if the transaction is a blob transaction.
+	if receipt.BlobGasUsed().Cmp(zero) > 0 {
+		fields = append(fields, fmt.Sprintf("Blob Gas Used: %s", receipt.BlobGasUsed()))
+	}
 	return fields
 }
 
-func SetUISkeleton() (blockList *widgets.List, blockInfo *widgets.List, transactionList *widgets.List, transactionInformationList *widgets.List, transactionInfo *widgets.Table, grid *ui.Grid, selectGrid *ui.Grid, blockGrid *ui.Grid, transactionGrid *ui.Grid, termUi UiSkeleton) {
+func SetUISkeleton(txPoolStatusSupported, zkEVMBatchesSupported bool) (blockList *widgets.List, blockInfo *widgets.List, transactionList *widgets.List, transactionInformationList *widgets.List, transactionInfo *widgets.Table, grid *ui.Grid, selectGrid *ui.Grid, blockGrid *ui.Grid, transactionGrid *ui.Grid, termUi UiSkeleton) {
 	// help := widgets.NewParagraph()
 	// help.Title = "Block Headers"
 	// help.Text = "Use the arrow keys to scroll through the transactions. Press <Esc> to go back to the explorer view"
@@ -479,8 +517,38 @@ func SetUISkeleton() (blockList *widgets.List, blockInfo *widgets.List, transact
 
 	termUi = UiSkeleton{}
 
+	// Top row
 	termUi.Current = widgets.NewParagraph()
 	termUi.Current.Title = "Current"
+	totalWidgets := 1
+
+	if txPoolStatusSupported {
+		termUi.TxPool = widgets.NewParagraph()
+		termUi.TxPool.Title = "TxPool"
+		totalWidgets++
+	}
+
+	if zkEVMBatchesSupported {
+		termUi.ZkEVM = widgets.NewParagraph()
+		termUi.ZkEVM.Title = "ZkEVM Batch No."
+		totalWidgets++
+
+		termUi.Rollup = widgets.NewParagraph()
+		termUi.Rollup.Title = "Rollup Info"
+		totalWidgets++
+	}
+
+	topRowBlocks := []interface{}{
+		ui.NewCol((5.0-float64(totalWidgets-1))/5.0, termUi.Current),
+	}
+	if txPoolStatusSupported {
+		topRowBlocks = append(topRowBlocks, ui.NewCol(1.0/5.0, termUi.TxPool))
+	}
+	if zkEVMBatchesSupported {
+		topRowBlocks = append(topRowBlocks, ui.NewCol(1.0/5.0, termUi.ZkEVM))
+
+		topRowBlocks = append(topRowBlocks, ui.NewCol(1.0/5.0, termUi.Rollup))
+	}
 
 	termUi.TxPerBlockChart = widgets.NewSparkline()
 	termUi.TxPerBlockChart.LineColor = ui.ColorRed
@@ -547,7 +615,7 @@ func SetUISkeleton() (blockList *widgets.List, blockInfo *widgets.List, transact
 	termUi.Receipts.WrapText = true
 
 	grid.Set(
-		ui.NewRow(1.0/10, termUi.Current),
+		ui.NewRow(1.0/10, topRowBlocks...),
 
 		ui.NewRow(2.0/10,
 			ui.NewCol(1.0/5, slg0),
@@ -567,7 +635,7 @@ func SetUISkeleton() (blockList *widgets.List, blockInfo *widgets.List, transact
 	)
 
 	selectGrid.Set(
-		ui.NewRow(1.0/10, termUi.Current),
+		ui.NewRow(1.0/10, topRowBlocks...),
 
 		ui.NewRow(2.0/10,
 			ui.NewCol(1.0/5, slg0),

@@ -5,23 +5,24 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/0xPolygon/polygon-cli/util"
 	lru "github.com/hashicorp/golang-lru"
-	"github.com/maticnetwork/polygon-cli/util"
 
 	_ "embed"
 
 	"github.com/ethereum/go-ethereum/ethclient"
 	ethrpc "github.com/ethereum/go-ethereum/rpc"
 
+	"github.com/0xPolygon/polygon-cli/cmd/monitor/ui"
+	"github.com/0xPolygon/polygon-cli/metrics"
+	"github.com/0xPolygon/polygon-cli/rpctypes"
 	"github.com/cenkalti/backoff/v4"
 	termui "github.com/gizak/termui/v3"
-	"github.com/maticnetwork/polygon-cli/cmd/monitor/ui"
-	"github.com/maticnetwork/polygon-cli/metrics"
-	"github.com/maticnetwork/polygon-cli/rpctypes"
 	"github.com/rs/zerolog/log"
 )
 
@@ -57,27 +58,42 @@ var (
 
 type (
 	monitorStatus struct {
-		TopDisplayedBlock   *big.Int
-		UpperBlock          *big.Int
-		LowerBlock          *big.Int
-		ChainID             *big.Int
-		HeadBlock           *big.Int
-		PeerCount           uint64
-		GasPrice            *big.Int
-		PendingCount        uint64
-		QueuedCount         uint64
-		SelectedBlock       rpctypes.PolyBlock
-		SelectedTransaction rpctypes.PolyTransaction
-		BlockCache          *lru.Cache   `json:"-"`
-		BlocksLock          sync.RWMutex `json:"-"`
+		TopDisplayedBlock    *big.Int
+		UpperBlock           *big.Int
+		LowerBlock           *big.Int
+		ChainID              *big.Int
+		ForkID               uint64
+		HeadBlock            *big.Int
+		PeerCount            uint64
+		GasPrice             *big.Int
+		TxPoolStatus         txPoolStatus
+		ZkEVMBatches         zkEVMBatches
+		SelectedBlock        rpctypes.PolyBlock
+		SelectedTransaction  rpctypes.PolyTransaction
+		BlockCache           *lru.Cache   `json:"-"`
+		BlocksLock           sync.RWMutex `json:"-"`
+		RollupAddress        string
+		RollupManagerAddress string
 	}
 	chainState struct {
-		HeadBlock    uint64
-		ChainID      *big.Int
-		PeerCount    uint64
-		GasPrice     *big.Int
-		PendingCount uint64
-		QueuedCount  uint64
+		HeadBlock            uint64
+		ChainID              *big.Int
+		PeerCount            uint64
+		GasPrice             *big.Int
+		TxPoolStatus         txPoolStatus
+		ZkEVMBatches         zkEVMBatches
+		ForkID               uint64
+		RollupAddress        string
+		RollupManagerAddress string
+	}
+	txPoolStatus struct {
+		pending uint64
+		queued  uint64
+	}
+	zkEVMBatches struct {
+		trusted  uint64
+		virtual  uint64
+		verified uint64
 	}
 	historicalDataPoint struct {
 		SampleTime  time.Time
@@ -111,6 +127,22 @@ func monitor(ctx context.Context) error {
 		return errBatchRequestsNotSupported
 	}
 
+	// Check if tx pool status is supported.
+	txPoolStatusSupported := false
+	if _, _, err = util.GetTxPoolStatus(rpc); err != nil {
+		log.Debug().Err(err).Msg("Unable to get tx pool status")
+	} else {
+		txPoolStatusSupported = true
+	}
+
+	// Check if zkevm batches are supported.
+	zkEVMBatchesSupported := false
+	if _, _, _, err = util.GetZkEVMBatches(rpc); err != nil {
+		log.Debug().Err(err).Msg("Unable to get zkevm batches")
+	} else {
+		zkEVMBatchesSupported = true
+	}
+
 	ms := new(monitorStatus)
 	ms.BlocksLock.Lock()
 	ms.BlockCache, err = lru.New(blockCacheLimit)
@@ -121,8 +153,8 @@ func monitor(ctx context.Context) error {
 	ms.BlocksLock.Unlock()
 
 	ms.ChainID = big.NewInt(0)
-	ms.PendingCount = 0
-	ms.QueuedCount = 0
+	ms.TxPoolStatus = txPoolStatus{}
+	ms.ZkEVMBatches = zkEVMBatches{}
 
 	observedPendingTxs = make(historicalRange, 0)
 
@@ -141,14 +173,17 @@ func monitor(ctx context.Context) error {
 			for {
 				err = fetchCurrentBlockData(ctx, ec, ms, isUiRendered)
 				if err != nil {
-					continue
+					log.Error().Msg(fmt.Sprintf("Error: unable to fetch current block data: %v", err))
+					// Send the error to the errChan channel to return.
+					errChan <- err
+					return
 				}
 				if ms.TopDisplayedBlock == nil || ms.SelectedBlock == nil {
 					ms.TopDisplayedBlock = ms.HeadBlock
 				}
 				if !isUiRendered {
 					go func() {
-						errChan <- renderMonitorUI(ctx, ec, ms, rpc)
+						errChan <- renderMonitorUI(ctx, ec, ms, rpc, txPoolStatusSupported, zkEVMBatchesSupported)
 					}()
 					isUiRendered = true
 				}
@@ -158,6 +193,11 @@ func monitor(ctx context.Context) error {
 		}
 	}()
 
+	if !isUiRendered {
+		// If UI cannot be rendered and returns, close the goroutine.
+		ctx.Done()
+	}
+	// Receive the errors from errChan and return to exit.
 	err = <-errChan
 	return err
 }
@@ -186,9 +226,29 @@ func getChainState(ctx context.Context, ec *ethclient.Client) (*chainState, erro
 		return nil, fmt.Errorf("couldn't estimate gas: %s", err.Error())
 	}
 
-	cs.PendingCount, cs.QueuedCount, err = util.GetTxPoolStatus(ec.Client())
+	cs.TxPoolStatus.pending, cs.TxPoolStatus.queued, err = util.GetTxPoolStatus(ec.Client())
 	if err != nil {
-		log.Debug().Err(err).Msg("Unable to get pending and queued transaction count")
+		log.Debug().Err(err).Msg("Unable to get tx pool status")
+	}
+
+	cs.ZkEVMBatches.trusted, cs.ZkEVMBatches.virtual, cs.ZkEVMBatches.verified, err = util.GetZkEVMBatches(ec.Client())
+	if err != nil {
+		log.Debug().Err(err).Msg("Unable to get zkevm batches")
+	}
+
+	cs.ForkID, err = util.GetForkID(ec.Client())
+	if err != nil {
+		log.Debug().Err(err).Msg("Unable to get fork id")
+	}
+
+	cs.RollupAddress, err = util.GetRollupAddress(ec.Client())
+	if err != nil {
+		log.Debug().Err(err).Msg("Unable to get rollup address")
+	}
+
+	cs.RollupManagerAddress, err = util.GetRollupManagerAddress(ec.Client())
+	if err != nil {
+		log.Debug().Err(err).Msg("Unable to get rollup manager address")
 	}
 
 	return cs, nil
@@ -214,7 +274,7 @@ func fetchCurrentBlockData(ctx context.Context, ec *ethclient.Client, ms *monito
 		time.Sleep(interval)
 		return err
 	}
-	observedPendingTxs = append(observedPendingTxs, historicalDataPoint{SampleTime: time.Now(), SampleValue: float64(cs.PendingCount)})
+	observedPendingTxs = append(observedPendingTxs, historicalDataPoint{SampleTime: time.Now(), SampleValue: float64(cs.TxPoolStatus.pending)})
 	if len(observedPendingTxs) > maxDataPoints {
 		observedPendingTxs = observedPendingTxs[len(observedPendingTxs)-maxDataPoints:]
 	}
@@ -231,8 +291,11 @@ func fetchCurrentBlockData(ctx context.Context, ec *ethclient.Client, ms *monito
 	ms.ChainID = cs.ChainID
 	ms.PeerCount = cs.PeerCount
 	ms.GasPrice = cs.GasPrice
-	ms.PendingCount = cs.PendingCount
-	ms.QueuedCount = cs.QueuedCount
+	ms.TxPoolStatus = cs.TxPoolStatus
+	ms.ZkEVMBatches = cs.ZkEVMBatches
+	ms.ForkID = cs.ForkID
+	ms.RollupAddress = cs.RollupAddress
+	ms.RollupManagerAddress = cs.RollupManagerAddress
 
 	return
 }
@@ -366,7 +429,7 @@ func (ms *monitorStatus) processBatchesConcurrently(ctx context.Context, rpc *et
 	return errors.Join(errs...)
 }
 
-func renderMonitorUI(ctx context.Context, ec *ethclient.Client, ms *monitorStatus, rpc *ethrpc.Client) error {
+func renderMonitorUI(ctx context.Context, ec *ethclient.Client, ms *monitorStatus, rpc *ethrpc.Client, txPoolStatusSupported, zkEVMBatchesSupported bool) error {
 	if err := termui.Init(); err != nil {
 		log.Error().Err(err).Msg("Failed to initialize UI")
 		return err
@@ -375,7 +438,7 @@ func renderMonitorUI(ctx context.Context, ec *ethclient.Client, ms *monitorStatu
 
 	currentMode := monitorModeExplorer
 
-	blockTable, blockInfo, transactionList, transactionInformationList, transactionInfo, grid, selectGrid, blockGrid, transactionGrid, skeleton := ui.SetUISkeleton()
+	blockTable, blockInfo, transactionList, transactionInformationList, transactionInfo, grid, selectGrid, blockGrid, transactionGrid, skeleton := ui.SetUISkeleton(txPoolStatusSupported, zkEVMBatchesSupported)
 
 	termWidth, termHeight := termui.TerminalDimensions()
 	windowSize = termHeight/2 - 4
@@ -393,19 +456,43 @@ func renderMonitorUI(ctx context.Context, ec *ethclient.Client, ms *monitorStatu
 		if currentMode == monitorModeHelp {
 			// TODO add some help context?
 		} else if currentMode == monitorModeSelectBlock {
-
+			toBlockNumber := ms.TopDisplayedBlock
+			fromBlockNumber := new(big.Int).Sub(toBlockNumber, big.NewInt(int64(windowSize-1)))
+			if fromBlockNumber.Cmp(zero) < 0 {
+				fromBlockNumber.SetInt64(0) // We cannot have block numbers less than 0.
+			}
+			renderedBlocksTemp := make([]rpctypes.PolyBlock, 0, windowSize)
+			ms.BlocksLock.RLock()
+			for i := new(big.Int).Set(fromBlockNumber); i.Cmp(toBlockNumber) <= 0; i.Add(i, big.NewInt(1)) {
+				if block, ok := ms.BlockCache.Get(i.String()); ok {
+					renderedBlocksTemp = append(renderedBlocksTemp, block.(rpctypes.PolyBlock))
+				} else {
+					// If for some reason the block is not in the cache after fetching, handle this case.
+					log.Warn().Str("blockNumber", i.String()).Msg("Block should be in cache but is not")
+				}
+			}
+			ms.BlocksLock.RUnlock()
+			renderedBlocks = renderedBlocksTemp
 			rows, title := ui.GetSelectedBlocksList(renderedBlocks)
 			blockTable.Rows = rows
 			blockTable.Title = title
 
 			// in monitorSelectModeTransaction, blocks will always be selected
 			transactionColumnRatio := []int{30, 5, 20, 20, 5, 10}
-			ms.SelectedBlock = renderedBlocks[len(renderedBlocks)-blockTable.SelectedRow]
+			// Sanity check for renderedBlocks table to avoid panic
+			if len(renderedBlocks)-blockTable.SelectedRow < 0 {
+				return
+			} else if len(renderedBlocks) == 0 {
+				return
+			} else {
+				ms.SelectedBlock = renderedBlocks[len(renderedBlocks)-blockTable.SelectedRow]
+			}
 			blockInfo.Rows = ui.GetSimpleBlockFields(ms.SelectedBlock)
 			transactionInfo.ColumnWidths = getColumnWidths(transactionColumnRatio, transactionInfo.Dx())
 			transactionInfo.Rows = ui.GetBlockTxTable(ms.SelectedBlock, ms.ChainID)
 			transactionInfo.Title = fmt.Sprintf("Latest Transactions for Block #%s", ms.SelectedBlock.Number().String())
 
+			termui.Clear()
 			termui.Render(selectGrid)
 			return
 		} else if currentMode == monitorModeBlock {
@@ -417,7 +504,21 @@ func renderMonitorUI(ctx context.Context, ec *ethclient.Client, ms *monitorStatu
 
 			baseFee := ms.SelectedBlock.BaseFee()
 			if transactionList.SelectedRow != 0 {
-				ms.SelectedTransaction = ms.SelectedBlock.Transactions()[transactionList.SelectedRow-1]
+				transactions := ms.SelectedBlock.Transactions()
+				if len(transactions) > 0 {
+					index := transactionList.SelectedRow - 1
+					if index >= 0 && index < len(transactions) {
+						ms.SelectedTransaction = transactions[index]
+					} else {
+						log.Error().
+							Int("row", transactionList.SelectedRow).
+							Msg("Selected row is out of range for transactions")
+					}
+				} else {
+					log.Debug().
+						Int("block", int(ms.SelectedBlock.Number().Uint64())).
+						Msg("No transactions available in the selected block")
+				}
 				transactionInformationList.Rows = ui.GetSimpleTxFields(ms.SelectedTransaction, ms.ChainID, baseFee)
 			}
 			termui.Clear()
@@ -430,7 +531,22 @@ func renderMonitorUI(ctx context.Context, ec *ethclient.Client, ms *monitorStatu
 			return
 		} else if currentMode == monitorModeTransaction {
 			baseFee := ms.SelectedBlock.BaseFee()
-			skeleton.TxInfo.Rows = ui.GetSimpleTxFields(ms.SelectedBlock.Transactions()[transactionList.SelectedRow-1], ms.ChainID, baseFee)
+			transactions := ms.SelectedBlock.Transactions()
+			if len(transactions) > 0 {
+				index := transactionList.SelectedRow - 1
+				if index >= 0 && index < len(transactions) {
+					tx := transactions[index]
+					skeleton.TxInfo.Rows = ui.GetSimpleTxFields(tx, ms.ChainID, baseFee)
+				} else {
+					log.Error().
+						Int("row", transactionList.SelectedRow).
+						Msg("Selected row is out of range for transactions")
+				}
+			} else {
+				log.Debug().
+					Int("block", int(ms.SelectedBlock.Number().Uint64())).
+					Msg("No transactions available in the selected block")
+			}
 			skeleton.Receipts.Rows = ui.GetSimpleReceipt(ctx, rpc, ms.SelectedTransaction)
 
 			termui.Clear()
@@ -452,8 +568,8 @@ func renderMonitorUI(ctx context.Context, ec *ethclient.Client, ms *monitorStatu
 			Str("HeadBlock", ms.HeadBlock.String()).
 			Uint64("PeerCount", ms.PeerCount).
 			Str("GasPrice", ms.GasPrice.String()).
-			Uint64("PendingCount", ms.PendingCount).
-			Uint64("QueuedCount", ms.QueuedCount).
+			Interface("TxPoolStatus", ms.TxPoolStatus).
+			Interface("ZkEVMBatches", ms.ZkEVMBatches).
 			Msg("Redrawing")
 
 		if blockTable.SelectedRow == 0 {
@@ -484,11 +600,31 @@ func renderMonitorUI(ctx context.Context, ec *ethclient.Client, ms *monitorStatu
 		}
 		ms.BlocksLock.RUnlock()
 		renderedBlocks = renderedBlocksTemp
+		renderedBlocksMeanGasPrice := metrics.GetMeanGasPricePerBlock(renderedBlocks)
+		// First initialization will render no gas price because the GasPriceChart will have no data.
+		if renderedBlocksMeanGasPrice == nil {
+			skeleton.Current.Text = ui.GetCurrentText(skeleton.Current, ms.HeadBlock, "--", ms.PeerCount, ms.ChainID, rpcUrl)
+		} else {
+			if len(renderedBlocksMeanGasPrice) >= 1 {
+				// Under normal cases, the gas price will be derived from the last element of the GasPriceChart with 2 decimal places precision.
+				gasPriceStr := strconv.FormatFloat(renderedBlocksMeanGasPrice[len(renderedBlocksMeanGasPrice)-1]/1000000000, 'f', 2, 64)
+				skeleton.Current.Text = ui.GetCurrentText(skeleton.Current, ms.HeadBlock, gasPriceStr, ms.PeerCount, ms.ChainID, rpcUrl)
+			}
+		}
 
-		log.Debug().Int("skeleton.Current.Inner.Dy()", skeleton.Current.Inner.Dy()).Int("skeleton.Current.Inner.Dx()", skeleton.Current.Inner.Dx()).Msg("the dimension of the current box")
-		skeleton.Current.Text = ui.GetCurrentBlockInfo(ms.HeadBlock, ms.GasPrice, ms.PeerCount, ms.PendingCount, ms.QueuedCount, ms.ChainID, renderedBlocks, skeleton.Current.Inner.Dx(), skeleton.Current.Inner.Dy())
+		if txPoolStatusSupported {
+			skeleton.TxPool.Text = ui.GetTxPoolText(skeleton.TxPool, ms.TxPoolStatus.pending, ms.TxPoolStatus.queued)
+		}
+
+		// if zkEVMBatchesSupported == true, this means the network will also support ForkIDs.
+		if zkEVMBatchesSupported {
+			skeleton.ZkEVM.Text = ui.GetZkEVMText(skeleton.ZkEVM, ms.ZkEVMBatches.trusted, ms.ZkEVMBatches.virtual, ms.ZkEVMBatches.verified)
+
+			skeleton.Rollup.Text = ui.GetRollupText(skeleton.Rollup, ms.ForkID, ms.RollupAddress, ms.RollupManagerAddress)
+		}
+
 		skeleton.TxPerBlockChart.Data = metrics.GetTxsPerBlock(renderedBlocks)
-		skeleton.GasPriceChart.Data = metrics.GetMeanGasPricePerBlock(renderedBlocks)
+		skeleton.GasPriceChart.Data = renderedBlocksMeanGasPrice // equivalent to metrics.GetMeanGasPricePerBlock(renderedBlocks)
 		skeleton.BlockSizeChart.Data = metrics.GetSizePerBlock(renderedBlocks)
 		// skeleton.pendingTxChart.Data = metrics.GetUnclesPerBlock(renderedBlocks)
 		skeleton.PendingTxChart.Data = observedPendingTxs.getValues(25)
@@ -502,28 +638,25 @@ func renderMonitorUI(ctx context.Context, ec *ethclient.Client, ms *monitorStatu
 		blockTable.TextStyle = termui.NewStyle(termui.ColorWhite)
 		blockTable.SelectedRowStyle = termui.NewStyle(termui.ColorWhite, termui.ColorRed, termui.ModifierBold)
 		transactionColumnRatio := []int{30, 5, 20, 20, 5, 10}
-		if blockTable.SelectedRow > 0 && blockTable.SelectedRow <= len(blockTable.Rows) {
+		if blockTable.SelectedRow > 0 && blockTable.SelectedRow <= len(blockTable.Rows) && (len(renderedBlocks)-blockTable.SelectedRow) >= 0 {
 			// Only changed the selected block when the user presses the up down keys.
 			// Otherwise this will adjust when the table is updated automatically.
-			if setBlock {
+			if setBlock && ms.SelectedBlock != nil {
 				log.Debug().
 					Int("blockTable.SelectedRow", blockTable.SelectedRow).
 					Int("renderedBlocks", len(renderedBlocks)).
 					Msg("setBlock")
 
-				ms.SelectedBlock = renderedBlocks[len(renderedBlocks)-blockTable.SelectedRow]
 				blockInfo.Rows = ui.GetSimpleBlockFields(ms.SelectedBlock)
 				transactionInfo.ColumnWidths = getColumnWidths(transactionColumnRatio, transactionInfo.Dx())
 				transactionInfo.Rows = ui.GetBlockTxTable(ms.SelectedBlock, ms.ChainID)
 				transactionInfo.Title = fmt.Sprintf("Latest Transactions for Block #%s", ms.SelectedBlock.Number().String())
-
 				setBlock = false
 				log.Debug().Uint64("blockNumber", ms.SelectedBlock.Number().Uint64()).Msg("Selected block changed")
 			}
 		} else {
 			ms.SelectedBlock = nil
 			blockInfo.Rows = []string{}
-
 			transactionInfo.ColumnWidths = getColumnWidths(transactionColumnRatio, transactionInfo.Dx())
 			if len(renderedBlocks) > 0 {
 				i := len(renderedBlocks) - 1
@@ -644,7 +777,6 @@ func renderMonitorUI(ctx context.Context, ec *ethclient.Client, ms *monitorStatu
 					}
 					// blockTable.SelectedRow += 1
 					blockTable.ScrollDown()
-
 					setBlock = true
 				} else if e.ID == "<Up>" {
 					log.Debug().Int("blockTable.SelectedRow", blockTable.SelectedRow).Int("windowSize", windowSize).Msg("Up")
@@ -696,13 +828,41 @@ func renderMonitorUI(ctx context.Context, ec *ethclient.Client, ms *monitorStatu
 				setBlock = true
 			case "G", "<End>":
 				if len(renderedBlocks) < windowSize {
-					ms.TopDisplayedBlock = ms.HeadBlock
 					blockTable.SelectedRow = len(renderedBlocks)
 				} else {
 					blockTable.SelectedRow = max(windowSize, len(renderedBlocks))
 				}
 				setBlock = true
 			case "<C-f>", "<PageDown>":
+				// When pressing PageDown beyond the genesis block, redraw the monitor screen to avoid freezing at the previous rendered blocks.
+				if len(renderedBlocks) == 0 {
+					currentMode = monitorModeExplorer
+					blockTable.SelectedRow = 0
+					forceRedraw = true
+					redraw(ms, true)
+					break
+				}
+
+				if renderedBlocks[0].Number().String() == "0" || renderedBlocks[0].Number().String() == "1" {
+					blockTable.SelectedRow = len(renderedBlocks)
+					forceRedraw = true
+					redraw(ms, true)
+					break
+				}
+
+				// If the length of the renderedBlocks (the visible blocks in the monitor) is less than the windowSize, select the last element of the renderedBlocks
+				if len(renderedBlocks) < windowSize {
+					blockTable.SelectedRow = len(renderedBlocks)
+				}
+
+				// PageDown key also enforces monitorModeSelectBlock in addition to the arrow Down key
+				if blockTable.SelectedRow == 0 {
+					blockTable.SelectedRow = 1
+					setBlock = true
+					currentMode = monitorModeSelectBlock
+					break
+				}
+
 				nextTopBlockNumber := new(big.Int).Sub(ms.TopDisplayedBlock, big.NewInt(int64(windowSize)))
 				if nextTopBlockNumber.Cmp(zero) < 0 {
 					nextTopBlockNumber.SetInt64(0)
@@ -735,6 +895,14 @@ func renderMonitorUI(ctx context.Context, ec *ethclient.Client, ms *monitorStatu
 				forceRedraw = true
 				redraw(ms, true)
 			case "<C-b>", "<PageUp>":
+				// PageUp key also enforces monitorModeSelectBlock in addition to the arrow Up key
+				if blockTable.SelectedRow == 0 {
+					blockTable.SelectedRow = 1
+					setBlock = true
+					currentMode = monitorModeSelectBlock
+					break
+				}
+
 				nextTopBlockNumber := new(big.Int).Add(ms.TopDisplayedBlock, big.NewInt(int64(windowSize)))
 				if nextTopBlockNumber.Cmp(ms.HeadBlock) > 0 {
 					nextTopBlockNumber.SetInt64(ms.HeadBlock.Int64())
